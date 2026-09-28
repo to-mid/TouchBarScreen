@@ -12,17 +12,29 @@ struct CapturableDisplay: Equatable {
 }
 
 struct CapturedFrame {
-    let image: CGImage
+    let image: CIImage
     let cursorPosition: CGPoint
 }
 
-enum CaptureError: LocalizedError {
+enum CaptureError: LocalizedError, Equatable {
     case displayUnavailable
+    case screenRecordingPermissionDenied
 
     var errorDescription: String? {
         switch self {
         case .displayUnavailable:
             return "所选显示器已不可用，请刷新显示器列表。"
+        case .screenRecordingPermissionDenied:
+            return "没有屏幕录制权限。请在系统设置的“隐私与安全性”中允许 TouchBarScreen 录制屏幕，然后重新启动应用。"
+        }
+    }
+
+    var touchBarMessage: String {
+        switch self {
+        case .displayUnavailable:
+            return "显示器不可用，正在等待恢复"
+        case .screenRecordingPermissionDenied:
+            return "需要屏幕录制权限"
         }
     }
 }
@@ -36,14 +48,18 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         label: "com.local.TouchBarScreen.capture",
         qos: .userInteractive
     )
-    private let ciContext = CIContext(options: [
-        .cacheIntermediates: false
-    ])
+    private let stateLock = NSLock()
     private var stream: SCStream?
     private var cursorTimer: DispatchSourceTimer?
     private var capturedDisplayBounds = CGRect.zero
+    private var operationGeneration = 0
+    private var activeStream: SCStream?
+    private var pendingFrame: CapturedFrame?
+    private var isFrameDeliveryScheduled = false
 
+    @MainActor
     func availableDisplays() async throws -> [CapturableDisplay] {
+        try ensureScreenRecordingPermission()
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
             onScreenWindowsOnly: false
@@ -82,13 +98,20 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    @MainActor
     func start(displayID: CGDirectDisplayID, framesPerSecond: Int) async throws {
-        await stop()
+        operationGeneration += 1
+        let generation = operationGeneration
+        await stopCurrentStream()
+        try ensureScreenRecordingPermission()
 
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
             onScreenWindowsOnly: false
         )
+        guard generation == operationGeneration else {
+            throw CancellationError()
+        }
         guard let display = content.displays.first(where: {
             $0.displayID == displayID
         }) else {
@@ -97,7 +120,7 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let configuration = SCStreamConfiguration()
-        let scale = min(1, 2560 / Double(display.width))
+        let scale = min(1, 1280 / Double(display.width))
         configuration.width = max(1, Int(Double(display.width) * scale))
         configuration.height = max(1, Int(Double(display.height) * scale))
         configuration.minimumFrameInterval = CMTime(
@@ -108,7 +131,6 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.showsCursor = true
         configuration.capturesAudio = false
-        capturedDisplayBounds = CGDisplayBounds(displayID)
 
         let stream = SCStream(
             filter: filter,
@@ -121,19 +143,43 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             sampleHandlerQueue: sampleQueue
         )
         self.stream = stream
-        try await stream.startCapture()
-        startCursorTracking()
+        setActiveStream(stream, displayBounds: CGDisplayBounds(displayID))
+
+        do {
+            try await stream.startCapture()
+        } catch {
+            if self.stream === stream {
+                self.stream = nil
+                clearActiveStream(stream)
+            }
+            throw error
+        }
+
+        guard generation == operationGeneration, self.stream === stream else {
+            try? await stream.stopCapture()
+            throw CancellationError()
+        }
+        startCursorTracking(for: stream)
     }
 
+    @MainActor
     func stop() async {
+        operationGeneration += 1
+        await stopCurrentStream()
+    }
+
+    @MainActor
+    private func stopCurrentStream() async {
         cursorTimer?.cancel()
         cursorTimer = nil
 
         guard let stream else {
+            clearActiveStream(nil)
             return
         }
 
         self.stream = nil
+        clearActiveStream(stream)
         do {
             try await stream.stopCapture()
         } catch {
@@ -146,13 +192,19 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         didStopWithError error: any Error
     ) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.stream === stream else {
+            guard let self else {
                 return
             }
-            self.stream = nil
-            self.cursorTimer?.cancel()
-            self.cursorTimer = nil
-            self.onStop?(error)
+            Task { @MainActor in
+                guard self.stream === stream else {
+                    return
+                }
+                self.stream = nil
+                self.clearActiveStream(stream)
+                self.cursorTimer?.cancel()
+                self.cursorTimer = nil
+                self.onStop?(error)
+            }
         }
     }
 
@@ -163,45 +215,38 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     ) {
         guard outputType == .screen,
               sampleBuffer.isValid,
-              let pixelBuffer = sampleBuffer.imageBuffer else {
-            return
-        }
-
-        let image = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(
-            image,
-            from: image.extent
-        ) else {
+              let pixelBuffer = sampleBuffer.imageBuffer,
+              isActiveStream(stream) else {
             return
         }
 
         let frame = CapturedFrame(
-            image: cgImage,
+            image: CIImage(cvPixelBuffer: pixelBuffer),
             cursorPosition: normalizedCursorPosition()
         )
-        DispatchQueue.main.async { [weak self] in
-            self?.onFrame?(frame)
-        }
+        enqueueLatestFrame(frame, from: stream)
     }
 
     private func normalizedCursorPosition() -> CGPoint {
-        guard capturedDisplayBounds.width > 0,
-              capturedDisplayBounds.height > 0,
+        stateLock.lock()
+        let displayBounds = capturedDisplayBounds
+        stateLock.unlock()
+
+        guard displayBounds.width > 0,
+              displayBounds.height > 0,
               let location = CGEvent(source: nil)?.location else {
             return CGPoint(x: 0.5, y: 0.5)
         }
 
-        let x = (location.x - capturedDisplayBounds.minX)
-            / capturedDisplayBounds.width
-        let y = (location.y - capturedDisplayBounds.minY)
-            / capturedDisplayBounds.height
+        let x = (location.x - displayBounds.minX) / displayBounds.width
+        let y = (location.y - displayBounds.minY) / displayBounds.height
         return CGPoint(
             x: min(max(x, 0), 1),
             y: min(max(y, 0), 1)
         )
     }
 
-    private func startCursorTracking() {
+    private func startCursorTracking(for stream: SCStream) {
         cursorTimer?.cancel()
 
         let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
@@ -211,15 +256,96 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             leeway: .milliseconds(5)
         )
         timer.setEventHandler { [weak self] in
-            guard let self else {
+            guard let self, self.isActiveStream(stream) else {
                 return
             }
             let position = self.normalizedCursorPosition()
             DispatchQueue.main.async { [weak self] in
-                self?.onCursorPosition?(position)
+                guard let self, self.isActiveStream(stream) else {
+                    return
+                }
+                self.onCursorPosition?(position)
             }
         }
         cursorTimer = timer
         timer.resume()
+    }
+
+    @MainActor
+    private func ensureScreenRecordingPermission() throws {
+        guard CGPreflightScreenCaptureAccess()
+                || CGRequestScreenCaptureAccess() else {
+            throw CaptureError.screenRecordingPermissionDenied
+        }
+    }
+
+    private func setActiveStream(
+        _ stream: SCStream,
+        displayBounds: CGRect
+    ) {
+        stateLock.lock()
+        activeStream = stream
+        capturedDisplayBounds = displayBounds
+        pendingFrame = nil
+        isFrameDeliveryScheduled = false
+        stateLock.unlock()
+    }
+
+    private func clearActiveStream(_ expectedStream: SCStream?) {
+        stateLock.lock()
+        if expectedStream == nil || activeStream === expectedStream {
+            activeStream = nil
+            capturedDisplayBounds = .zero
+            pendingFrame = nil
+            isFrameDeliveryScheduled = false
+        }
+        stateLock.unlock()
+    }
+
+    private func isActiveStream(_ stream: SCStream) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeStream === stream
+    }
+
+    private func enqueueLatestFrame(
+        _ frame: CapturedFrame,
+        from stream: SCStream
+    ) {
+        stateLock.lock()
+        guard activeStream === stream else {
+            stateLock.unlock()
+            return
+        }
+        pendingFrame = frame
+        guard !isFrameDeliveryScheduled else {
+            stateLock.unlock()
+            return
+        }
+        isFrameDeliveryScheduled = true
+        stateLock.unlock()
+
+        DispatchQueue.main.async { [weak self, weak stream] in
+            guard let self, let stream else {
+                return
+            }
+            self.deliverLatestFrame(from: stream)
+        }
+    }
+
+    private func deliverLatestFrame(from stream: SCStream) {
+        stateLock.lock()
+        guard activeStream === stream else {
+            stateLock.unlock()
+            return
+        }
+        let frame = pendingFrame
+        pendingFrame = nil
+        isFrameDeliveryScheduled = false
+        stateLock.unlock()
+
+        if let frame {
+            onFrame?(frame)
+        }
     }
 }

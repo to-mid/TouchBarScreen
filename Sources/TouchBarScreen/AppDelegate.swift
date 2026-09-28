@@ -1,21 +1,41 @@
 import AppKit
 import CoreGraphics
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private enum CaptureState: Equatable {
+        case idle
+        case starting
+        case waitingForFrame
+        case running
+        case recovering
+        case stopping
+    }
+
     private let captureEngine = ScreenCaptureEngine()
     private let touchBarController = TouchBarController()
     private let hotKeyManager = GlobalHotKeyManager()
     private var statusItem: NSStatusItem!
     private var displays: [CapturableDisplay] = []
     private var selectedDisplayID: CGDirectDisplayID?
-    private var isCapturing = false
+    private var captureState = CaptureState.idle
+    private var captureGeneration = 0
     private var hasReceivedFrame = false
-    private var framesPerSecond = 15
+    private var framesPerSecond = 10
     private var detailMagnification: CGFloat = 1
     private var persistentTouchBar = true
     private var touchBarRestoreGeneration = 0
     private var wantsCapture = false
     private var displayRecoveryTask: Task<Void, Never>?
+
+    private var isCapturing: Bool {
+        switch captureState {
+        case .starting, .waitingForFrame, .running:
+            return true
+        case .idle, .recovering, .stopping:
+            return false
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -25,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureHotKeys()
         configureWorkspaceObservers()
         Task {
-            await refreshDisplaysAndStart()
+            await refreshDisplays(startCaptureAfterRefresh: true)
         }
     }
 
@@ -119,6 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.touchBarController.setFrame(frame)
             if !self.hasReceivedFrame {
                 self.hasReceivedFrame = true
+                self.captureState = .running
                 self.rebuildMenu()
             }
         }
@@ -132,13 +153,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else {
                 return
             }
-            self.isCapturing = false
             self.hasReceivedFrame = false
             self.touchBarController.clearFrame()
             self.touchBarController.uninstall()
-            self.rebuildMenu()
             if self.wantsCapture {
+                self.captureState = .recovering
+                self.rebuildMenu()
                 self.scheduleDisplayRecovery(error: error)
+            } else {
+                self.captureState = .idle
+                self.rebuildMenu()
             }
         }
     }
@@ -189,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func refreshDisplaysAndStart() async {
+    private func refreshDisplays(startCaptureAfterRefresh: Bool) async {
         do {
             displays = try await captureEngine.availableDisplays()
 
@@ -211,10 +235,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
             rebuildMenu()
-            if selectedDisplayID != nil {
+            if startCaptureAfterRefresh, selectedDisplayID != nil {
                 await startCapture()
             }
         } catch {
+            let statusMessage = (error as? CaptureError)?.touchBarMessage
+                ?? "无法获取显示器"
+            touchBarController.showStatus(
+                statusMessage,
+                persistent: persistentTouchBar
+            )
             showError(error)
         }
     }
@@ -224,6 +254,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        captureState = .recovering
+        rebuildMenu()
         displayRecoveryTask?.cancel()
         let previouslySelectedDisplay = displays.first(where: {
             $0.id == selectedDisplayID
@@ -252,7 +284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
 
                     self.displays = availableDisplays
-                    self.selectedDisplayID = self.recoveredDisplayID(
+                    self.selectedDisplayID = DisplayRecovery.selectedDisplayID(
+                        currentID: self.selectedDisplayID,
                         in: availableDisplays,
                         previouslySelected: previouslySelectedDisplay
                     )
@@ -290,26 +323,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func recoveredDisplayID(
-        in availableDisplays: [CapturableDisplay],
-        previouslySelected: CapturableDisplay?
-    ) -> CGDirectDisplayID? {
-        if let selectedDisplayID,
-           availableDisplays.contains(where: { $0.id == selectedDisplayID }) {
-            return selectedDisplayID
-        }
-        if let previouslySelected,
-           let matchingDisplay = availableDisplays.first(where: {
-               $0.name == previouslySelected.name
-                   && $0.width == previouslySelected.width
-                   && $0.height == previouslySelected.height
-           }) {
-            return matchingDisplay.id
-        }
-        return availableDisplays.first(where: { !$0.isMain })?.id
-            ?? availableDisplays.first?.id
-    }
-
     @MainActor
     @discardableResult
     private func startCapture(
@@ -320,24 +333,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         wantsCapture = true
+        captureGeneration += 1
+        let generation = captureGeneration
+        captureState = .starting
+        touchBarController.showStatus(
+            "正在启动屏幕采集",
+            persistent: persistentTouchBar
+        )
+        rebuildMenu()
         if scheduleRecoveryOnFailure {
             displayRecoveryTask?.cancel()
             displayRecoveryTask = nil
         }
         do {
             hasReceivedFrame = false
-            isCapturing = true
             try await captureEngine.start(
                 displayID: selectedDisplayID,
                 framesPerSecond: framesPerSecond
             )
+            guard generation == captureGeneration, wantsCapture else {
+                return CancellationError()
+            }
+            captureState = .waitingForFrame
             touchBarController.install(persistent: persistentTouchBar)
             rebuildMenu()
             return nil
         } catch {
-            isCapturing = false
-            touchBarController.clearFrame()
-            touchBarController.uninstall()
+            guard generation == captureGeneration else {
+                return error
+            }
+            if error is CancellationError {
+                return error
+            }
+            captureState = wantsCapture ? .recovering : .idle
+            let statusMessage = (error as? CaptureError)?.touchBarMessage
+                ?? "屏幕采集失败"
+            touchBarController.showStatus(
+                statusMessage,
+                persistent: persistentTouchBar
+            )
             rebuildMenu()
             if scheduleRecoveryOnFailure, error is CaptureError {
                 scheduleDisplayRecovery(error: error)
@@ -351,13 +385,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func stopCapture() async {
         wantsCapture = false
+        captureGeneration += 1
+        let generation = captureGeneration
+        captureState = .stopping
         displayRecoveryTask?.cancel()
         displayRecoveryTask = nil
-        isCapturing = false
         hasReceivedFrame = false
         touchBarController.clearFrame()
         touchBarController.uninstall()
         await captureEngine.stop()
+        guard generation == captureGeneration else {
+            return
+        }
+        captureState = .idle
         rebuildMenu()
     }
 
@@ -365,9 +405,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         let statusTitle: String
-        if hasReceivedFrame {
+        if captureState == .recovering {
+            statusTitle = "正在恢复显示器连接"
+        } else if captureState == .stopping {
+            statusTitle = "正在停止"
+        } else if hasReceivedFrame {
             statusTitle = "正在镜像 · 已收到画面"
-        } else if isCapturing {
+        } else if captureState == .starting {
+            statusTitle = "正在启动采集"
+        } else if captureState == .waitingForFrame {
             statusTitle = "正在镜像 · 等待画面"
         } else {
             statusTitle = "未启动"
@@ -409,8 +455,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(frameRateMenuItem())
         menu.addItem(shortcutsMenuItem())
 
+        let persistentTitle: String
+        if persistentTouchBar,
+           isCapturing,
+           !touchBarController.isPersistent {
+            persistentTitle = "常驻 Touch Bar（不可用，已回退）"
+        } else {
+            persistentTitle = "常驻 Touch Bar（私有 API）"
+        }
         let persistent = NSMenuItem(
-            title: "常驻 Touch Bar（私有 API）",
+            title: persistentTitle,
             action: #selector(togglePersistentTouchBar(_:)),
             keyEquivalent: ""
         )
@@ -572,10 +626,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let number = sender.representedObject as? NSNumber else {
             return
         }
+        let shouldRestartCapture = wantsCapture
         selectedDisplayID = number.uint32Value
         UserDefaults.standard.set(number, forKey: "selectedDisplayID")
-        Task {
-            await startCapture()
+        rebuildMenu()
+        if shouldRestartCapture {
+            Task {
+                await startCapture()
+            }
         }
     }
 
@@ -755,8 +813,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc
     private func refreshDisplays(_ sender: NSMenuItem) {
+        let shouldRestartCapture = wantsCapture
         Task {
-            await refreshDisplaysAndStart()
+            await refreshDisplays(
+                startCaptureAfterRefresh: shouldRestartCapture
+            )
         }
     }
 
@@ -765,8 +826,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.alertStyle = .warning
         alert.messageText = "TouchBarScreen"
         alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "好")
+        let isPermissionError =
+            (error as? CaptureError) == .screenRecordingPermissionDenied
+        if isPermissionError {
+            alert.addButton(withTitle: "打开系统设置")
+            alert.addButton(withTitle: "好")
+        } else {
+            alert.addButton(withTitle: "好")
+        }
         NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        let response = alert.runModal()
+        if isPermissionError,
+           response == .alertFirstButtonReturn,
+           let url = URL(
+               string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+           ) {
+            NSWorkspace.shared.open(url)
+        }
     }
 }

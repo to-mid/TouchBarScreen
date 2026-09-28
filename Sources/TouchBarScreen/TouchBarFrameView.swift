@@ -1,8 +1,10 @@
 import AppKit
+import CoreImage
 
 final class TouchBarFrameView: NSView {
     private var image: NSImage?
     private var cursorPosition = CGPoint(x: 0.5, y: 0.5)
+    private var placeholderText = "等待虚拟屏幕画面..."
 
     var detailMagnification: CGFloat = 1 {
         didSet {
@@ -18,11 +20,11 @@ final class TouchBarFrameView: NSView {
         true
     }
 
-    func setFrameImage(_ cgImage: CGImage, cursorPosition: CGPoint) {
-        image = NSImage(
-            cgImage: cgImage,
-            size: NSSize(width: cgImage.width, height: cgImage.height)
-        )
+    func setFrameImage(_ ciImage: CIImage, cursorPosition: CGPoint) {
+        let representation = NSCIImageRep(ciImage: ciImage)
+        let image = NSImage(size: representation.size)
+        image.addRepresentation(representation)
+        self.image = image
         self.cursorPosition = cursorPosition
         needsDisplay = true
     }
@@ -30,6 +32,13 @@ final class TouchBarFrameView: NSView {
     func clearFrame() {
         image = nil
         cursorPosition = CGPoint(x: 0.5, y: 0.5)
+        placeholderText = "等待虚拟屏幕画面..."
+        needsDisplay = true
+    }
+
+    func showStatus(_ message: String) {
+        image = nil
+        placeholderText = message
         needsDisplay = true
     }
 
@@ -110,29 +119,11 @@ final class TouchBarFrameView: NSView {
             return
         }
 
-        let sourceWidth = min(
-            image.size.width,
-            rect.width / detailMagnification
-        )
-        let sourceHeight = min(
-            image.size.height,
-            rect.height / detailMagnification
-        )
-        let cursorX = cursorPosition.x * image.size.width
-        let cursorY = (1 - cursorPosition.y) * image.size.height
-        let originX = min(
-            max(0, cursorX - sourceWidth / 2),
-            image.size.width - sourceWidth
-        )
-        let originY = min(
-            max(0, cursorY - sourceHeight / 2),
-            image.size.height - sourceHeight
-        )
-        let sourceRect = CGRect(
-            x: originX,
-            y: originY,
-            width: sourceWidth,
-            height: sourceHeight
+        let sourceRect = ImageLayout.detailSourceRect(
+            imageSize: image.size,
+            destinationSize: rect.size,
+            normalizedCursorPosition: cursorPosition,
+            magnification: detailMagnification
         )
 
         image.draw(
@@ -146,16 +137,15 @@ final class TouchBarFrameView: NSView {
     }
 
     private func drawPlaceholder() {
-        let text = "等待虚拟屏幕画面..."
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .medium),
             .foregroundColor: NSColor.secondaryLabelColor
         ]
-        let size = text.size(withAttributes: attributes)
+        let size = placeholderText.size(withAttributes: attributes)
         let point = NSPoint(
             x: bounds.midX - size.width / 2,
             y: bounds.midY - size.height / 2
         )
-        text.draw(at: point, withAttributes: attributes)
+        placeholderText.draw(at: point, withAttributes: attributes)
     }
 }

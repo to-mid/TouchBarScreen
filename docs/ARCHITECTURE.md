@@ -10,7 +10,7 @@ TouchBarScreen 将 macOS 中一个真实或虚拟显示器的画面实时绘制�
 
 - AppKit：应用生命周期、菜单栏、Touch Bar 和绘图
 - ScreenCaptureKit：显示器枚举和实时屏幕采集
-- Core Image：将采集像素缓冲转换为 `CGImage`
+- Core Image：包装采集像素缓冲并延迟执行图像渲染
 - Core Graphics：显示器坐标和鼠标位置
 - Carbon HIToolbox：系统级全局快捷键
 - Objective-C Runtime：动态调用私有 Touch Bar API
@@ -30,12 +30,13 @@ TouchBarScreen 将 macOS 中一个真实或虚拟显示器的画面实时绘制�
 - 监听应用切换、Space 切换和显示器配置变化
 - 在显示器断开后执行恢复
 
-它维护两个不同的采集状态：
+它维护用户意图和实际采集状态：
 
-- `isCapturing`：当前是否存在正在工作的采集流程
 - `wantsCapture`：用户是否仍然希望保持采集
+- `CaptureState`：空闲、启动、等待首帧、运行、恢复和停止
 
-两者分离后，采集流因断屏意外停止时，应用仍可以判断是否应该自动恢复。
+两者分离后，采集流因断屏意外停止时，应用仍可以判断是否应该自动恢复。每次
+启停还会更新会话代号，异步操作完成后必须确认自己仍属于当前会话。
 
 ### ScreenCaptureEngine
 
@@ -52,14 +53,18 @@ TouchBarScreen 将 macOS 中一个真实或虚拟显示器的画面实时绘制�
 
 1. 根据 display ID 查找 `SCDisplay`。
 2. 创建不排除任何窗口的 `SCContentFilter`。
-3. 配置最大 2560 像素宽的 BGRA 视频流。
+3. 配置最大 1280 像素宽的 BGRA 视频流。
 4. 设置目标 FPS、队列深度 2，并关闭音频。
 5. 在独立的高优先级串行队列中接收视频帧。
-6. 将 `CVPixelBuffer` 转换为 `CIImage` 和 `CGImage`。
-7. 回到主线程分发 `CapturedFrame`。
+6. 将 `CVPixelBuffer` 包装为延迟渲染的 `CIImage`。
+7. 合并尚未交付的帧，只把最新 `CapturedFrame` 分发到主线程。
 
-限制最大采集宽度可以降低像素转换和 Touch Bar 绘制成本。Touch Bar 高度很小，
-继续处理显示器原始的 4K 或更高分辨率通常没有可见收益。
+限制最大采集宽度可以降低内存带宽和 Touch Bar 绘制成本。Touch Bar 高度很小，
+继续处理显示器原始的 4K 或更高分辨率通常没有可见收益。延迟渲染同时避免在
+采集队列中为每一帧主动创建完整尺寸的 `CGImage`。
+
+旧 `SCStream` 晚到的视频帧、鼠标位置和停止回调都会被忽略，避免快速切换
+显示器或帧率时覆盖新会话状态。
 
 ### TouchBarController
 
@@ -129,7 +134,8 @@ main.swift
 ```text
 SCStreamOutput
   -> CVPixelBuffer
-  -> CIContext.createCGImage()
+  -> CIImage（延迟渲染）
+  -> 最新帧合并
   -> CapturedFrame
   -> AppDelegate.onFrame
   -> TouchBarController.setFrame()

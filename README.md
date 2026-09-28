@@ -37,7 +37,8 @@ open dist/TouchBarScreen.app
 ```
 
 构建脚本会执行 Release 构建，将可执行文件和 `Info.plist` 组装到
-`dist/TouchBarScreen.app`，然后使用本机临时签名完成签署。
+`dist/TouchBarScreen.app`，使用本机临时签名完成签署，并生成带版本号的 ZIP
+安装包和 SHA-256 校验文件。
 
 第一次启动时，请在“系统设置 > 隐私与安全性 > 屏幕与系统音频录制”中允许
 TouchBarScreen 录制屏幕。授权后可能需要退出并重新打开应用。
@@ -66,8 +67,8 @@ TouchBarScreen 录制屏幕。授权后可能需要退出并重新打开应用�
 
 ## 工作原理
 
-应用通过 ScreenCaptureKit 获取显示器视频帧，将 `CVPixelBuffer` 转换为
-`CGImage`，再交给自定义 `NSView` 绘制到 `NSTouchBar`。
+应用通过 ScreenCaptureKit 获取显示器视频帧，将 `CVPixelBuffer` 包装为
+延迟渲染的 `CIImage`，再交给自定义 `NSView` 绘制到 `NSTouchBar`。
 
 ```text
 显示器或虚拟显示器
@@ -76,7 +77,7 @@ TouchBarScreen 录制屏幕。授权后可能需要退出并重新打开应用�
 ScreenCaptureKit / SCStream
         |
         v
-CVPixelBuffer -> CIImage -> CGImage
+CVPixelBuffer -> CIImage
         |
         v
 TouchBarFrameView
@@ -87,7 +88,8 @@ TouchBarFrameView
 ```
 
 采集帧率和鼠标跟踪相互独立。视频帧按照菜单中选择的 FPS 更新，鼠标位置约以
-30 Hz 采样，因此在较低采集帧率下，局部视图仍能及时跟随鼠标。
+30 Hz 采样，因此在较低采集帧率下，局部视图仍能及时跟随鼠标。主线程繁忙时
+只保留最新视频帧，避免旧帧排队增加延迟和内存压力。
 
 更完整的模块说明、调用链和恢复策略见
 [架构文档](docs/ARCHITECTURE.md)。
@@ -142,4 +144,4 @@ scripts/build-app.sh          App Bundle 构建脚本
 
 ## 版本
 
-当前首个版本为 `0.1.0`。
+当前版本为 `0.2.0`，完整改动见 [CHANGELOG.md](CHANGELOG.md)。

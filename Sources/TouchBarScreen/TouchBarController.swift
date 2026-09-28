@@ -36,14 +36,25 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private var isAppTouchBarInstalled = false
 
     func install(persistent: Bool) {
+        if isInstalled,
+           persistent == isPersistent,
+           isSystemModalPresented || isAppTouchBarInstalled {
+            return
+        }
+
+        if isSystemModalPresented {
+            dismissSystemModalTouchBar()
+            isSystemModalPresented = false
+        }
+        if isAppTouchBarInstalled {
+            NSApp.touchBar = nil
+            isAppTouchBarInstalled = false
+        }
+
         isInstalled = true
         isPersistent = persistent
 
         if persistent {
-            if isAppTouchBarInstalled {
-                NSApp.touchBar = nil
-                isAppTouchBarInstalled = false
-            }
             isSystemModalPresented = presentSystemModalTouchBar()
         }
 
@@ -92,6 +103,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     func clearFrame() {
         frameView.clearFrame()
+    }
+
+    func showStatus(_ message: String, persistent: Bool) {
+        frameView.showStatus(message)
+        install(persistent: persistent)
     }
 
     func updateCursorPosition(_ position: CGPoint) {
