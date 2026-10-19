@@ -144,4 +144,4 @@ scripts/build-app.sh          App Bundle 构建脚本
 
 ## 版本
 
-当前版本为 `0.2.0`，完整改动见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本为 `0.2.1`，完整改动见 [CHANGELOG.md](CHANGELOG.md)。
