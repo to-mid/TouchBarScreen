@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import ScreenCaptureKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -12,8 +13,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case stopping
     }
 
-    private let captureEngine = ScreenCaptureEngine()
-    private let touchBarController = TouchBarController()
+    private let captureEngine: ScreenCapturing
+    private let touchBarController: TouchBarControlling
     private let hotKeyManager = GlobalHotKeyManager()
     private var statusItem: NSStatusItem!
     private var displays: [CapturableDisplay] = []
@@ -28,6 +29,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var wantsCapture = false
     private var displayRecoveryTask: Task<Void, Never>?
 
+    init(
+        captureEngine: ScreenCapturing? = nil,
+        touchBarController: TouchBarControlling? = nil
+    ) {
+        self.captureEngine = captureEngine ?? ScreenCaptureEngine()
+        self.touchBarController = touchBarController ?? TouchBarController()
+        super.init()
+        configureCaptureCallbacks()
+    }
+
     private var isCapturing: Bool {
         switch captureState {
         case .starting, .waitingForFrame, .running:
@@ -41,7 +52,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         loadPreferences()
         configureStatusItem()
-        configureCaptureCallbacks()
         configureHotKeys()
         configureWorkspaceObservers()
         Task {
@@ -153,6 +163,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else {
                 return
             }
+            if let error = error as? SCStreamError,
+               error.code == .userStopped {
+                self.stopCapture()
+                return
+            }
             self.hasReceivedFrame = false
             self.touchBarController.clearFrame()
             self.touchBarController.uninstall()
@@ -213,9 +228,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func refreshDisplays(startCaptureAfterRefresh: Bool) async {
+    func refreshDisplays(
+        startCaptureAfterRefresh: Bool,
+        generation expectedGeneration: Int? = nil
+    ) async {
+        let generation = expectedGeneration ?? captureGeneration
+        guard generation == captureGeneration, !Task.isCancelled else {
+            return
+        }
         do {
-            displays = try await captureEngine.availableDisplays()
+            let availableDisplays = try await captureEngine.availableDisplays()
+            guard generation == captureGeneration, !Task.isCancelled else {
+                return
+            }
+            displays = availableDisplays
 
             let savedID = UserDefaults.standard.object(
                 forKey: "selectedDisplayID"
@@ -236,9 +262,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             rebuildMenu()
             if startCaptureAfterRefresh, selectedDisplayID != nil {
-                await startCapture()
+                wantsCapture = true
+                captureGeneration += 1
+                await startCapture(generation: captureGeneration)
             }
         } catch {
+            guard generation == captureGeneration, !Task.isCancelled else {
+                return
+            }
             let statusMessage = (error as? CaptureError)?.touchBarMessage
                 ?? "无法获取显示器"
             touchBarController.showStatus(
@@ -255,6 +286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         captureState = .recovering
+        captureGeneration += 1
+        let generation = captureGeneration
         rebuildMenu()
         displayRecoveryTask?.cancel()
         let previouslySelectedDisplay = displays.first(where: {
@@ -271,13 +304,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try? await Task.sleep(
                     nanoseconds: UInt64(delay * 1_000_000_000)
                 )
-                guard !Task.isCancelled, self.wantsCapture else {
+                guard !Task.isCancelled,
+                      self.wantsCapture,
+                      generation == self.captureGeneration else {
                     return
                 }
 
                 do {
                     let availableDisplays =
                         try await self.captureEngine.availableDisplays()
+                    guard !Task.isCancelled,
+                          self.wantsCapture,
+                          generation == self.captureGeneration else {
+                        return
+                    }
                     guard !availableDisplays.isEmpty else {
                         lastError = CaptureError.displayUnavailable
                         continue
@@ -301,12 +341,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.rebuildMenu()
 
                     if let startError = await self.startCapture(
+                        generation: generation,
                         scheduleRecoveryOnFailure: false
                     ) {
                         lastError = startError
                         continue
                     }
 
+                    guard !Task.isCancelled,
+                          generation == self.captureGeneration else {
+                        return
+                    }
                     self.displayRecoveryTask = nil
                     return
                 } catch {
@@ -314,6 +359,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
+            guard !Task.isCancelled,
+                  generation == self.captureGeneration else {
+                return
+            }
             self.displayRecoveryTask = nil
             if self.wantsCapture {
                 self.showError(
@@ -326,40 +375,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     @discardableResult
     private func startCapture(
+        generation: Int,
         scheduleRecoveryOnFailure: Bool = true
     ) async -> Error? {
+        guard generation == captureGeneration,
+              wantsCapture,
+              !Task.isCancelled else {
+            return CancellationError()
+        }
         guard let selectedDisplayID else {
             return CaptureError.displayUnavailable
         }
 
-        wantsCapture = true
-        captureGeneration += 1
-        let generation = captureGeneration
         captureState = .starting
         touchBarController.showStatus(
             "正在启动屏幕采集",
             persistent: persistentTouchBar
         )
         rebuildMenu()
-        if scheduleRecoveryOnFailure {
-            displayRecoveryTask?.cancel()
-            displayRecoveryTask = nil
-        }
         do {
             hasReceivedFrame = false
             try await captureEngine.start(
                 displayID: selectedDisplayID,
                 framesPerSecond: framesPerSecond
             )
-            guard generation == captureGeneration, wantsCapture else {
+            guard generation == captureGeneration,
+                  wantsCapture,
+                  !Task.isCancelled else {
                 return CancellationError()
             }
-            captureState = .waitingForFrame
+            captureState = hasReceivedFrame ? .running : .waitingForFrame
             touchBarController.install(persistent: persistentTouchBar)
             rebuildMenu()
             return nil
         } catch {
-            guard generation == captureGeneration else {
+            guard generation == captureGeneration, !Task.isCancelled else {
+                return error
+            }
+            if let error = error as? SCStreamError,
+               error.code == .userStopped {
+                stopCapture()
                 return error
             }
             if error is CancellationError {
@@ -382,26 +437,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @MainActor
-    private func stopCapture() async {
+    private func requestCaptureStart() {
+        wantsCapture = true
+        captureGeneration += 1
+        let generation = captureGeneration
+        displayRecoveryTask?.cancel()
+        displayRecoveryTask = nil
+        Task {
+            await startCapture(generation: generation)
+        }
+    }
+
+    private func stopCapture() {
         wantsCapture = false
         captureGeneration += 1
         let generation = captureGeneration
         captureState = .stopping
+        touchBarRestoreGeneration += 1
         displayRecoveryTask?.cancel()
         displayRecoveryTask = nil
         hasReceivedFrame = false
         touchBarController.clearFrame()
         touchBarController.uninstall()
-        await captureEngine.stop()
-        guard generation == captureGeneration else {
-            return
-        }
-        captureState = .idle
         rebuildMenu()
+        Task {
+            guard generation == captureGeneration else {
+                return
+            }
+            await captureEngine.stop()
+            guard generation == captureGeneration else {
+                return
+            }
+            captureState = .idle
+            rebuildMenu()
+        }
     }
 
     private func rebuildMenu() {
+        guard let statusItem else {
+            return
+        }
         let menu = NSMenu()
 
         let statusTitle: String
@@ -476,13 +551,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let toggleShortcut = hotKeyManager.shortcut(for: .toggleCapture)
         let toggle = NSMenuItem(
-            title: (isCapturing ? "停止镜像" : "启动镜像")
+            title: (wantsCapture ? "停止镜像" : "启动镜像")
                 + "    \(toggleShortcut.displayName)",
             action: #selector(toggleCapture(_:)),
             keyEquivalent: ""
         )
         toggle.target = self
-        toggle.isEnabled = selectedDisplayID != nil
+        toggle.isEnabled = wantsCapture || selectedDisplayID != nil
         menu.addItem(toggle)
 
         let refresh = NSMenuItem(
@@ -631,9 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(number, forKey: "selectedDisplayID")
         rebuildMenu()
         if shouldRestartCapture {
-            Task {
-                await startCapture()
-            }
+            requestCaptureStart()
         }
     }
 
@@ -779,10 +852,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forKey: "framesPerSecond"
         )
         rebuildMenu()
-        if isCapturing {
-            Task {
-                await startCapture()
-            }
+        if wantsCapture {
+            requestCaptureStart()
         }
     }
 
@@ -801,22 +872,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc
-    private func toggleCapture(_ sender: Any?) {
-        Task {
-            if isCapturing {
-                await stopCapture()
-            } else {
-                await startCapture()
-            }
+    func toggleCapture(_ sender: Any?) {
+        if wantsCapture {
+            stopCapture()
+        } else {
+            requestCaptureStart()
         }
     }
 
     @objc
-    private func refreshDisplays(_ sender: NSMenuItem) {
+    func refreshDisplays(_ sender: NSMenuItem) {
         let shouldRestartCapture = wantsCapture
+        let generation = captureGeneration
         Task {
             await refreshDisplays(
-                startCaptureAfterRefresh: shouldRestartCapture
+                startCaptureAfterRefresh: shouldRestartCapture,
+                generation: generation
             )
         }
     }

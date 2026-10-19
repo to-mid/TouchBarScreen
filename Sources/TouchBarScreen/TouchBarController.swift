@@ -1,7 +1,19 @@
 import AppKit
 import TouchBarPrivateBridge
 
-final class TouchBarController: NSObject, NSTouchBarDelegate {
+protocol TouchBarControlling: AnyObject {
+    var isPersistent: Bool { get }
+    func install(persistent: Bool)
+    func uninstall()
+    func refreshPersistentPresentation()
+    func setFrame(_ frame: CapturedFrame)
+    func clearFrame()
+    func showStatus(_ message: String, persistent: Bool)
+    func updateCursorPosition(_ position: CGPoint)
+    func setDetailMagnification(_ magnification: CGFloat)
+}
+
+final class TouchBarController: NSObject, TouchBarControlling, NSTouchBarDelegate {
     static let displayIdentifier = NSTouchBarItem.Identifier(
         "com.local.TouchBarScreen.display"
     )
@@ -78,7 +90,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             NSApp.touchBar = nil
             isAppTouchBarInstalled = false
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, !self.isInstalled else {
+                return
+            }
             NSApp.hide(nil)
         }
     }

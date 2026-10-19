@@ -39,7 +39,20 @@ enum CaptureError: LocalizedError, Equatable {
     }
 }
 
-final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
+protocol ScreenCapturing: AnyObject {
+    var onFrame: ((CapturedFrame) -> Void)? { get set }
+    var onCursorPosition: ((CGPoint) -> Void)? { get set }
+    var onStop: ((Error?) -> Void)? { get set }
+
+    @MainActor
+    func availableDisplays() async throws -> [CapturableDisplay]
+    @MainActor
+    func start(displayID: CGDirectDisplayID, framesPerSecond: Int) async throws
+    @MainActor
+    func stop() async
+}
+
+final class ScreenCaptureEngine: NSObject, ScreenCapturing, SCStreamOutput, SCStreamDelegate {
     var onFrame: ((CapturedFrame) -> Void)?
     var onCursorPosition: ((CGPoint) -> Void)?
     var onStop: ((Error?) -> Void)?
@@ -103,6 +116,9 @@ final class ScreenCaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         operationGeneration += 1
         let generation = operationGeneration
         await stopCurrentStream()
+        guard generation == operationGeneration else {
+            throw CancellationError()
+        }
         try ensureScreenRecordingPermission()
 
         let content = try await SCShareableContent.excludingDesktopWindows(
