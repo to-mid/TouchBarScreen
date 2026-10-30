@@ -106,6 +106,9 @@ sourceHeight = detailHeight / magnification
 闭包通知 `AppDelegate`。自定义快捷键以 JSON 编码后保存到 `UserDefaults`。
 
 录制新快捷键期间，管理器会暂时注销已有快捷键，防止录制动作触发真实命令。
+上一个、下一个显示器动作按显示器菜单顺序循环选择，复用菜单直接选择显示器的
+路径，保存选择并在用户仍希望采集时启动新会话。新动作追加在原有动作 ID 之后，
+保留已有快捷键设置的对应关系。
 
 ### TouchBarPrivateBridge
 

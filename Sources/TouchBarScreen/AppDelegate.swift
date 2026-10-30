@@ -196,6 +196,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.adjustMagnification(by: 0.1)
             case .setMagnification:
                 self.showMagnificationPrompt()
+            case .previousDisplay:
+                self.selectPreviousDisplay(nil)
+            case .nextDisplay:
+                self.selectNextDisplay(nil)
             }
         }
     }
@@ -526,6 +530,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        for action in [
+            GlobalHotKeyManager.Action.previousDisplay, .nextDisplay
+        ] {
+            let item = NSMenuItem(
+                title: "\(action.title)    "
+                    + hotKeyManager.shortcut(for: action).displayName,
+                action: action == .previousDisplay
+                    ? #selector(selectPreviousDisplay(_:))
+                    : #selector(selectNextDisplay(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.isEnabled = displays.count > 1
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
         menu.addItem(magnificationMenuItem())
         menu.addItem(frameRateMenuItem())
         menu.addItem(shortcutsMenuItem())
@@ -701,13 +721,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let number = sender.representedObject as? NSNumber else {
             return
         }
+        selectDisplay(id: number.uint32Value)
+    }
+
+    private func selectDisplay(id: CGDirectDisplayID) {
+        guard id != selectedDisplayID,
+              displays.contains(where: { $0.id == id }) else {
+            return
+        }
         let shouldRestartCapture = wantsCapture
-        selectedDisplayID = number.uint32Value
-        UserDefaults.standard.set(number, forKey: "selectedDisplayID")
+        selectedDisplayID = id
+        UserDefaults.standard.set(
+            NSNumber(value: id),
+            forKey: "selectedDisplayID"
+        )
         rebuildMenu()
         if shouldRestartCapture {
             requestCaptureStart()
         }
+    }
+
+    @objc
+    func selectPreviousDisplay(_ sender: Any?) {
+        selectAdjacentDisplay(offset: -1)
+    }
+
+    @objc
+    func selectNextDisplay(_ sender: Any?) {
+        selectAdjacentDisplay(offset: 1)
+    }
+
+    private func selectAdjacentDisplay(offset: Int) {
+        guard displays.count > 1 else {
+            return
+        }
+        let index: Int
+        if let currentIndex = displays.firstIndex(where: {
+            $0.id == selectedDisplayID
+        }) {
+            index = (currentIndex + offset + displays.count) % displays.count
+        } else {
+            index = offset > 0 ? 0 : displays.count - 1
+        }
+        selectDisplay(id: displays[index].id)
     }
 
     private var formattedMagnification: String {

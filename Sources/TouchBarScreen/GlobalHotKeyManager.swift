@@ -30,6 +30,8 @@ final class GlobalHotKeyManager {
         case decreaseMagnification
         case increaseMagnification
         case setMagnification
+        case previousDisplay
+        case nextDisplay
 
         var title: String {
             switch self {
@@ -41,6 +43,10 @@ final class GlobalHotKeyManager {
                 return "增大缩放"
             case .setMagnification:
                 return "输入缩放倍率"
+            case .previousDisplay:
+                return "上一个显示器"
+            case .nextDisplay:
+                return "下一个显示器"
             }
         }
     }
@@ -67,6 +73,16 @@ final class GlobalHotKeyManager {
                 keyCode: UInt32(kVK_ANSI_M),
                 modifiers: modifiers,
                 keyLabel: "M"
+            ),
+            .previousDisplay: HotKeyShortcut(
+                keyCode: UInt32(kVK_LeftArrow),
+                modifiers: modifiers,
+                keyLabel: "←"
+            ),
+            .nextDisplay: HotKeyShortcut(
+                keyCode: UInt32(kVK_RightArrow),
+                modifiers: modifiers,
+                keyLabel: "→"
             )
         ]
     }()

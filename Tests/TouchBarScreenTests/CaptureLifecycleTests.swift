@@ -312,6 +312,153 @@ final class CaptureLifecycleTests: XCTestCase {
         XCTAssertFalse(presentation.isInstalled)
         XCTAssertEqual(presentation.installCount, installationsAfterStop)
     }
+
+    func testNextDisplaySwitchesRunningCaptureAndSavesSelection() async {
+        await withDisplaySelection { delegate, engine, presentation in
+            let switched = expectation(description: "Next display captured")
+            engine.startHandler = { switched.fulfill() }
+
+            delegate.selectNextDisplay(nil)
+            await fulfillment(of: [switched], timeout: 1)
+
+            XCTAssertEqual(engine.startedDisplayIDs, [1, 2])
+            XCTAssertEqual(
+                UserDefaults.standard.integer(forKey: "selectedDisplayID"), 2
+            )
+            XCTAssertTrue(presentation.isInstalled)
+        }
+    }
+
+    func testPreviousDisplayWrapsToLastDisplay() async {
+        await withDisplaySelection { delegate, engine, _ in
+            let switched = expectation(description: "Last display captured")
+            engine.startHandler = { switched.fulfill() }
+
+            delegate.selectPreviousDisplay(nil)
+            await fulfillment(of: [switched], timeout: 1)
+
+            XCTAssertEqual(engine.startedDisplayIDs, [1, 3])
+        }
+    }
+
+    func testNextDisplayWrapsToFirstDisplay() async {
+        await withDisplaySelection { delegate, engine, _ in
+            let switched = expectation(description: "First display captured")
+            engine.startHandler = { switched.fulfill() }
+
+            delegate.selectNextDisplay(nil)
+            delegate.selectNextDisplay(nil)
+            delegate.selectNextDisplay(nil)
+            await fulfillment(of: [switched], timeout: 1)
+
+            XCTAssertEqual(engine.startedDisplayIDs, [1, 1])
+        }
+    }
+
+    func testRapidDisplaySwitchingStartsOnlyLatestSelection() async {
+        await withDisplaySelection { delegate, engine, _ in
+            let switched = expectation(description: "Latest display captured")
+            engine.startHandler = { switched.fulfill() }
+
+            delegate.selectNextDisplay(nil)
+            delegate.selectNextDisplay(nil)
+            await fulfillment(of: [switched], timeout: 1)
+
+            XCTAssertEqual(engine.startedDisplayIDs, [1, 3])
+        }
+    }
+
+    func testSwitchingWhileStoppedOnlyChangesNextCaptureTarget() async {
+        await withDisplaySelection(startCapture: false) {
+            delegate, engine, presentation in
+            delegate.selectNextDisplay(nil)
+            delegate.selectNextDisplay(nil)
+            delegate.selectPreviousDisplay(nil)
+
+            XCTAssertEqual(engine.startCount, 0)
+            XCTAssertFalse(presentation.isInstalled)
+            XCTAssertEqual(
+                UserDefaults.standard.integer(forKey: "selectedDisplayID"), 2
+            )
+
+            let started = expectation(description: "Selected display captured")
+            engine.startHandler = { started.fulfill() }
+            delegate.toggleCapture(nil)
+            await fulfillment(of: [started], timeout: 1)
+
+            XCTAssertEqual(engine.startedDisplayIDs, [2])
+        }
+    }
+
+    func testSwitchingWithOneDisplayDoesNotRestartCapture() async {
+        await withDisplaySelection(displayCount: 1) { delegate, engine, _ in
+            delegate.selectNextDisplay(nil)
+            delegate.selectPreviousDisplay(nil)
+            await Task.yield()
+
+            XCTAssertEqual(engine.startedDisplayIDs, [1])
+        }
+    }
+
+    func testSwitchingWithNoDisplaysDoesNotStartCapture() async {
+        await withDisplaySelection(displayCount: 0, startCapture: false) {
+            delegate, engine, presentation in
+            delegate.selectNextDisplay(nil)
+            delegate.selectPreviousDisplay(nil)
+            await Task.yield()
+
+            XCTAssertEqual(engine.startCount, 0)
+            XCTAssertFalse(presentation.isInstalled)
+        }
+    }
+
+    func testStopInvalidatesPendingDisplaySwitch() async {
+        await withDisplaySelection { delegate, engine, presentation in
+            let stopped = expectation(description: "Capture stopped")
+            engine.onStopCalled = { stopped.fulfill() }
+
+            delegate.selectNextDisplay(nil)
+            delegate.toggleCapture(nil)
+            await fulfillment(of: [stopped], timeout: 1)
+
+            XCTAssertEqual(engine.startedDisplayIDs, [1])
+            XCTAssertFalse(presentation.isInstalled)
+        }
+    }
+
+    private func withDisplaySelection(
+        displayCount: Int = 3,
+        startCapture: Bool = true,
+        body: (AppDelegate, StubCaptureEngine, StubTouchBarController) async -> Void
+    ) async {
+        let defaults = UserDefaults.standard
+        let savedID = defaults.object(forKey: "selectedDisplayID")
+        defaults.set(1, forKey: "selectedDisplayID")
+        defer {
+            if let savedID {
+                defaults.set(savedID, forKey: "selectedDisplayID")
+            } else {
+                defaults.removeObject(forKey: "selectedDisplayID")
+            }
+        }
+        let displays = (0..<displayCount).map { index in
+            CapturableDisplay(
+                id: UInt32(index + 1),
+                name: "Display \(index + 1)",
+                width: 1920,
+                height: 1080,
+                isMain: index == 0
+            )
+        }
+        let engine = StubCaptureEngine(displays: displays)
+        let presentation = StubTouchBarController()
+        let delegate = AppDelegate(
+            captureEngine: engine,
+            touchBarController: presentation
+        )
+        await delegate.refreshDisplays(startCaptureAfterRefresh: startCapture)
+        await body(delegate, engine, presentation)
+    }
 }
 
 private final class StubCaptureEngine: ScreenCapturing {
@@ -325,6 +472,7 @@ private final class StubCaptureEngine: ScreenCapturing {
     private(set) var availableDisplaysCount = 0
     private(set) var startCount = 0
     private(set) var stopCount = 0
+    private(set) var startedDisplayIDs: [CGDirectDisplayID] = []
 
     init(displays: [CapturableDisplay]) {
         self.displays = displays
@@ -342,6 +490,7 @@ private final class StubCaptureEngine: ScreenCapturing {
     @MainActor
     func start(displayID: CGDirectDisplayID, framesPerSecond: Int) async throws {
         startCount += 1
+        startedDisplayIDs.append(displayID)
         try await startHandler?()
     }
 
